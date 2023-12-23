@@ -1,44 +1,72 @@
-import UIKit
 import Accelerate
 
 extension CGImage {
     
     func addWhiteBackground() -> CGImage {
+        // No alpha anyway
         guard [.none, .noneSkipLast, .noneSkipFirst].contains(self.alphaInfo) == false else { return self }
         
-        let size = CGSize(width: width, height: height)
-        UIGraphicsBeginImageContextWithOptions(size, false, 1)
-                
-        guard let ctx = UIGraphicsGetCurrentContext() else { return self }
-        defer { UIGraphicsEndImageContext() }
+        guard var format = vImage_CGImageFormat(cgImage: self),
+              let topBuffer = try? vImage.PixelBuffer<vImage.Interleaved8x4>(cgImage: self, cgImageFormat: &format) else {
+            return self
+        }
+        let bottomLayer = vImage.PixelBuffer<vImage.Interleaved8x4>(size: topBuffer.size)
+        let destinationBuffer = vImage.PixelBuffer<vImage.Interleaved8x4>(size: topBuffer.size)
+
+        _ = bottomLayer.withUnsafePointerToVImageBuffer { pointer in
+            vImageBufferFill_ARGB8888(pointer, [255, 255, 255, 255], 0)
+        }
+
+        if [.last, .premultipliedLast, .noneSkipLast].contains(alphaInfo) {
+            topBuffer.permuteChannels(
+                to: (3, 0, 1, 2),
+                destination: topBuffer
+            )
+        }
         
-        let rect = CGRect(origin: .zero, size: size)
-        ctx.setFillColor(UIColor.white.cgColor)
-        ctx.fill(rect)
-        ctx.concatenate(CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: size.height))
-        ctx.draw(self, in: rect)
+        bottomLayer.alphaComposite(
+            .premultiplied,
+            topLayer: topBuffer,
+            destination: destinationBuffer
+        )
         
-        return UIGraphicsGetImageFromCurrentImageContext()?.cgImage ?? self
+        
+        guard let destinationFormat = vImage_CGImageFormat(
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            colorSpace: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
+        ) else {
+            return self
+        }
+        
+        return destinationBuffer.makeCGImage(
+            cgImageFormat: destinationFormat
+        ) ?? self
     }
 
     func toGrayscale() -> CGImage {
         // Our job here is done
         guard colorSpace?.numberOfComponents != 1 else { return self }
 
-        guard let format = vImage_CGImageFormat(cgImage: self),
-              // The source image bufffer
-              var sourceBuffer = try? vImage_Buffer(
+        guard var format = vImage_CGImageFormat(cgImage: self),
+              let sourceBuffer = try? vImage.PixelBuffer<vImage.Interleaved8x4>(
                 cgImage: self,
-                format: format
-              ),
-              // The 1-channel, 8-bit vImage buffer used as the operation destination.
-              var destinationBuffer = try? vImage_Buffer(
-                width: Int(sourceBuffer.width),
-                height: Int(sourceBuffer.height),
-                bitsPerPixel: 8
-              ) else {
+                cgImageFormat: &format
+              )
+        else {
+            
             return self
         }
+        // Move alpha channel if necessary
+        if [.last, .premultipliedLast, .noneSkipLast].contains(alphaInfo) {
+            sourceBuffer.permuteChannels(
+                to: (3, 0, 1, 2),
+                destination: sourceBuffer
+            )
+        }
+
+        let destinationBuffer = vImage.PixelBuffer<vImage.Planar8>(width: width, height: height)
 
         // Declare the three coefficients that model the eye's sensitivity
         // to color.
@@ -48,48 +76,36 @@ extension CGImage {
 
         // Create a 1D matrix containing the three luma coefficients that
         // specify the color-to-grayscale conversion.
-        let divisor: Int32 = 0x1000
+        let divisor: Int = 0x1000
         let fDivisor = Float(divisor)
 
-        var coefficientsMatrix = [
-            Int16(redCoefficient * fDivisor),
-            Int16(greenCoefficient * fDivisor),
-            Int16(blueCoefficient * fDivisor)
-        ]
+        let coefficientsMatrix: (Int, Int, Int, Int) = (
+            0,
+            Int(redCoefficient * fDivisor),
+            Int(greenCoefficient * fDivisor),
+            Int(blueCoefficient * fDivisor)
+        )
 
         // Use the matrix of coefficients to compute the scalar luminance by
         // returning the dot product of each RGB pixel and the coefficients
         // matrix.
-        let preBias: [Int16] = [0, 0, 0, 0]
-        let postBias: Int32 = 0
-
-        vImageMatrixMultiply_ARGB8888ToPlanar8(
-            &sourceBuffer,
-            &destinationBuffer,
-            &coefficientsMatrix,
-            divisor,
-            preBias,
-            postBias,
-            vImage_Flags(kvImageNoFlags)
+        let preBias: (Int, Int, Int, Int) = (0, 0, 0, 0)
+        let postBias: Int = 0
+        sourceBuffer.multiply(
+            by: coefficientsMatrix,
+            divisor: divisor,
+            preBias: preBias,
+            postBias: postBias,
+            destination: destinationBuffer
         )
-
-        // Create a 1-channel, 8-bit grayscale format that's used to
-        // generate a displayable image.
-        guard let monoFormat = vImage_CGImageFormat(
+        
+        guard let destinationFormat = vImage_CGImageFormat(
             bitsPerComponent: 8,
             bitsPerPixel: 8,
             colorSpace: CGColorSpaceCreateDeviceGray(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-            renderingIntent: .defaultIntent
-        ) else {
-                return self
-        }
-
-        // Create a Core Graphics image from the grayscale destination buffer.
-        guard let result = try? destinationBuffer.createCGImage(format: monoFormat) else {
-            return self
-        }
-
-        return result
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
+        ) else { return self }
+        
+        return destinationBuffer.makeCGImage(cgImageFormat: destinationFormat) ?? self
     }
 }

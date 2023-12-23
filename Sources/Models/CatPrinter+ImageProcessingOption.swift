@@ -1,4 +1,3 @@
-
 public extension CatPrinter {
     struct ImageProcessingOption: OptionSet {
         public let rawValue: Int

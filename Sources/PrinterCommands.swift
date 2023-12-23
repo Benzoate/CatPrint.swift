@@ -1,10 +1,3 @@
-//
-//  PrinterCommands.swift
-//  daily-print
-//
-//  Created by Michael on 14/12/2023.
-//
-
 import Foundation
 import CoreGraphics
 

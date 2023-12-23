@@ -1,10 +1,3 @@
-//
-//  File.swift
-//  
-//
-//  Created by Michael on 23/12/2023.
-//
-
 import Foundation
 @_implementationOnly import CoreBluetooth
 import Combine
