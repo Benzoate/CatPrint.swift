@@ -19,6 +19,9 @@ public actor CatPrinter {
     
     private var cancellables: [AnyCancellable] = []
     
+    private var printQueue: [Printer: [[PrinterCommands]]] = [:]
+    private var isPrinting: [Printer: Bool] = [:]
+    
     @MainActor public init(
         settings: Settings = .default
     ) {
@@ -72,9 +75,27 @@ public actor CatPrinter {
          ]
         
         logger.debug("Image processed into \(imageCommands.count) print commands")
-
+        guard isPrinting[printer] != true else {
+            if printQueue[printer] == nil { printQueue[printer] = [] }
+            printQueue[printer]?.append(setupCommands + imageCommands + endCommands)
+            return
+        }
+        isPrinting[printer] = true
+        await executeCommands(
+            setupCommands + imageCommands + endCommands,
+            bluetoothInfo: bluetoothInfo
+        )
+        while printQueue[printer]?.isEmpty == false {
+            guard let commands = printQueue[printer]?.removeFirst() else { continue }
+            await executeCommands(commands, bluetoothInfo: bluetoothInfo)
+        }
+        isPrinting[printer] = false
+    }
+    
+    private func executeCommands(_ commands: [PrinterCommands], bluetoothInfo: BluetoothInfo) async {
+        
         var commandData = Data(
-            (setupCommands + imageCommands + endCommands)
+            commands
             .map(\.commandData)
             .reduce(into: [UInt8](), +=)
         )
