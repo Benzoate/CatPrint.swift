@@ -1,6 +1,14 @@
 # CatPrint.swift
 
-A swift library for printing to the cheap “Cat” thermoprinters that can be found on sites such as Aliexpress.
+A swift library for printing to the cheap “Cat” thermoprinters that can be found on sites such as Aliexpress. I have tested this with the MX10, but I believe that these models will work with this library.
+
+- CYLO BT PRINTER
+- MXTP-100
+- AZ-P2108X
+- MX10 ✅ __[confirmed]__
+- MX11
+- BQ02
+- EWTTO ET-Z049
 
 ## Installation
 Add the repo to your project using SwiftPackage Manager
