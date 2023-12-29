@@ -5,7 +5,7 @@ import PackageDescription
 let package = Package(
     name: "CatPrint",
     platforms: [.iOS(.v16),
-                .macOS(.v10_15),
+                .macOS(.v13),
                 .tvOS(.v16)],
     products: [
         .library(
