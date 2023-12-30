@@ -110,20 +110,34 @@ enum PrinterCommands {
 extension PrinterCommands {
     static func printImageCommands(
         _ printerData: PrinterImageData,
-        printerWidth: Int = 384
+        printerWidth: Int = 384,
+        useRunLengthEncoding: Bool
     ) -> [Self] {
         (0..<printerData.height)
             .map {
-                Self.rowCommand(printerData, row: $0, printerWidth: printerWidth)
+                Self.rowCommand(
+                    printerData,
+                    row: $0,
+                    printerWidth: printerWidth,
+                    useRunLengthEncoding: useRunLengthEncoding
+                )
             }
     }
     
     private static func rowCommand(
         _ printerData: PrinterImageData,
         row: Int,
-        printerWidth: Int
+        printerWidth: Int,
+        useRunLengthEncoding: Bool
     ) -> PrinterCommands {
         let dataSlice = printerData.data[(row * printerData.width)..<((row + 1) * printerData.width)]
+
+        guard useRunLengthEncoding else {
+            return .printByteEncodedRow(
+                byteEncode(dataSlice, printerWidth: printerWidth)
+            )
+        }
+        
 
         let runLengthEncoded = runLengthEncode(
             dataSlice,

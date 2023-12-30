@@ -66,7 +66,11 @@ public actor CatPrinter {
             .latticeStart,
             .setEnergy(255)
         ]
-        let imageCommands: [PrinterCommands] = PrinterCommands.printImageCommands(processImage(image: image, options: imageProcessing))
+        let imageCommands: [PrinterCommands] = PrinterCommands.printImageCommands(
+            processImage(image: image, options: imageProcessing),
+            printerWidth: settings.printerWidth,
+            useRunLengthEncoding: settings.useRunLengthEncoding
+        )
         let endCommands: [PrinterCommands] = [
             .feedPaper(25),
             .setPaper,
