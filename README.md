@@ -42,9 +42,12 @@ func searchForPrinters() async {
 You can then listen for available cat printers by iterating `availablePrintersUpdates`. The stream yields the current set immediately, then every subsequent change as printers connect and disconnect.
 
 ```swift
-for await printers in await printer.availablePrintersUpdates {
-    guard printers.isEmpty == false else { continue }
-    state = .foundPrinters(Array(printers))
+@MainActor
+func observePrinters() async {
+    for await printers in await printer.availablePrintersUpdates {
+        guard printers.isEmpty == false else { continue }
+        state = .foundPrinters(Array(printers))
+    }
 }
 ```
 

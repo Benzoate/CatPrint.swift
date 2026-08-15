@@ -17,7 +17,11 @@ public actor CatPrinter {
                 }
             }
             Task {
-                await printer?.addAvailablePrintersContinuation(id, continuation)
+                guard let printer else {
+                    continuation.finish()
+                    return
+                }
+                await printer.addAvailablePrintersContinuation(id, continuation)
             }
         }
     }
@@ -32,6 +36,8 @@ public actor CatPrinter {
     private var scanningPeripherals: [CBPeripheral] = []
     private var connectedPrinters: [Printer: BluetoothInfo] = [:]
     private var availablePrintersContinuations: [UUID: AsyncStream<Set<Printer>>.Continuation] = [:]
+    private var cancelledAvailablePrintersContinuations: Set<UUID> = []
+    private var observationTasks: [Task<Void, Never>] = []
     
     private var printQueue: [Printer: [[PrinterCommands]]] = [:]
     private var isPrinting: [Printer: Bool] = [:]
@@ -47,6 +53,7 @@ public actor CatPrinter {
     }
 
     deinit {
+        observationTasks.forEach { $0.cancel() }
         for continuation in availablePrintersContinuations.values {
             continuation.finish()
         }
@@ -235,9 +242,14 @@ public actor CatPrinter {
         logger.debug("Disconnected from peripheral \(peripheral.name ?? "")<\(peripheral.identifier)>")
         scanningPeripherals.removeAll(where: { $0.identifier == peripheral.identifier })
 
-        if let printer = availablePrinters.first(where: { $0.uuid == peripheral.identifier }) {
-            updateAvailablePrinters { $0.remove(printer) }
-        }
+        let printer = availablePrinters.first { $0.uuid == peripheral.identifier }
+            ?? connectedPrinters.keys.first { $0.uuid == peripheral.identifier }
+        guard let printer else { return }
+
+        connectedPrinters[printer] = nil
+        printQueue[printer] = nil
+        isPrinting[printer] = nil
+        updateAvailablePrinters { $0.remove(printer) }
     }
     
     private func registerMatchedCharacteristic(
@@ -282,59 +294,64 @@ public actor CatPrinter {
         let printerNames = settings.printerName
         let characteristicId = settings.charateristic
 
-        Task { [weak self] in
-            for await discovery in peripheralDiscovered {
-                let peripheral = discovery.peripheral
-                guard printerNames.isEmpty || printerNames.contains(peripheral.name ?? "") else {
-                    continue
+        // Detached so these loops do not inherit the actor and keep CatPrinter alive.
+        observationTasks = [
+            Task.detached { [weak self] in
+                for await discovery in peripheralDiscovered {
+                    let peripheral = discovery.peripheral
+                    guard printerNames.isEmpty || printerNames.contains(peripheral.name ?? "") else {
+                        continue
+                    }
+                    await self?.connectToPeripheral(peripheral)
                 }
-                await self?.connectToPeripheral(peripheral)
-            }
-        }
-
-        Task {
-            for await peripheral in peripheralConnected {
-                peripheral.discoverServices(nil)
-            }
-        }
-
-        Task { [weak self] in
-            for await peripheral in peripheralDisconnected {
-                await self?.onPeripheralDisconnected(peripheral)
-            }
-        }
-
-        Task { [weak self] in
-            for await peripheral in servicesDiscovered {
-                await self?.onServicesDiscovered(peripheral)
-            }
-        }
-
-        Task { [weak self] in
-            for await (peripheral, service) in characteristicsDiscovered {
-                let matches = (service.characteristics ?? [])
-                    .filter { characteristicId == $0.uuid.uuidString }
-                for characteristic in matches {
-                    await self?.registerMatchedCharacteristic(
-                        peripheral: peripheral,
-                        service: service,
-                        characteristic: characteristic
-                    )
+            },
+            Task.detached {
+                for await peripheral in peripheralConnected {
+                    peripheral.discoverServices(nil)
+                }
+            },
+            Task.detached { [weak self] in
+                for await peripheral in peripheralDisconnected {
+                    await self?.onPeripheralDisconnected(peripheral)
+                }
+            },
+            Task.detached { [weak self] in
+                for await peripheral in servicesDiscovered {
+                    await self?.onServicesDiscovered(peripheral)
+                }
+            },
+            Task.detached { [weak self] in
+                for await (peripheral, service) in characteristicsDiscovered {
+                    let matches = (service.characteristics ?? [])
+                        .filter { characteristicId == $0.uuid.uuidString }
+                    for characteristic in matches {
+                        await self?.registerMatchedCharacteristic(
+                            peripheral: peripheral,
+                            service: service,
+                            characteristic: characteristic
+                        )
+                    }
                 }
             }
-        }
+        ]
     }
 
     private func addAvailablePrintersContinuation(
         _ id: UUID,
         _ continuation: AsyncStream<Set<Printer>>.Continuation
     ) {
+        if cancelledAvailablePrintersContinuations.remove(id) != nil {
+            continuation.finish()
+            return
+        }
         availablePrintersContinuations[id] = continuation
         continuation.yield(availablePrinters)
     }
 
     private func removeAvailablePrintersContinuation(_ id: UUID) {
-        availablePrintersContinuations.removeValue(forKey: id)
+        if availablePrintersContinuations.removeValue(forKey: id) == nil {
+            cancelledAvailablePrintersContinuations.insert(id)
+        }
     }
 
     private func updateAvailablePrinters(_ update: (inout Set<Printer>) -> Void) {
@@ -358,10 +375,10 @@ private extension CatPrinter {
         private let peripheralDisconnectedContinuation: AsyncStream<CBPeripheral>.Continuation
 
         override init() {
-            (stateUpdated, stateUpdatedContinuation) = makeAsyncStream()
-            (peripheralDiscovered, peripheralDiscoveredContinuation) = makeAsyncStream()
-            (peripheralConnected, peripheralConnectedContinuation) = makeAsyncStream()
-            (peripheralDisconnected, peripheralDisconnectedContinuation) = makeAsyncStream()
+            (stateUpdated, stateUpdatedContinuation) = makeAsyncStream(bufferingPolicy: .bufferingNewest(1))
+            (peripheralDiscovered, peripheralDiscoveredContinuation) = makeAsyncStream(bufferingPolicy: .bufferingNewest(16))
+            (peripheralConnected, peripheralConnectedContinuation) = makeAsyncStream(bufferingPolicy: .bufferingNewest(8))
+            (peripheralDisconnected, peripheralDisconnectedContinuation) = makeAsyncStream(bufferingPolicy: .bufferingNewest(8))
             super.init()
         }
 
@@ -417,8 +434,8 @@ private extension CatPrinter {
         private let characteristicsDiscoveredContinuation: AsyncStream<(CBPeripheral, CBService)>.Continuation
 
         override init() {
-            (servicesDiscovered, servicesDiscoveredContinuation) = makeAsyncStream()
-            (characteristicsDiscovered, characteristicsDiscoveredContinuation) = makeAsyncStream()
+            (servicesDiscovered, servicesDiscoveredContinuation) = makeAsyncStream(bufferingPolicy: .bufferingNewest(8))
+            (characteristicsDiscovered, characteristicsDiscoveredContinuation) = makeAsyncStream(bufferingPolicy: .bufferingNewest(8))
             super.init()
         }
 
@@ -442,7 +459,7 @@ private extension CatPrinter {
 }
 
 private func makeAsyncStream<Element>(
-    bufferingPolicy: AsyncStream<Element>.Continuation.BufferingPolicy = .unbounded
+    bufferingPolicy: AsyncStream<Element>.Continuation.BufferingPolicy
 ) -> (AsyncStream<Element>, AsyncStream<Element>.Continuation) {
     var continuation: AsyncStream<Element>.Continuation!
     let stream = AsyncStream<Element>(bufferingPolicy: bufferingPolicy) { continuation = $0 }
