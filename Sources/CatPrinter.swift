@@ -35,9 +35,7 @@ public actor CatPrinter {
     
     private var scanningPeripherals: [CBPeripheral] = []
     private var connectedPrinters: [Printer: BluetoothInfo] = [:]
-    private var availablePrintersContinuations: [UUID: AsyncStream<Set<Printer>>.Continuation] = [:]
-    private var cancelledAvailablePrintersContinuations: Set<UUID> = []
-    private var observationTasks: [Task<Void, Never>] = []
+    private let lifetime = Lifetime()
     
     private var isPrinting: [Printer: Bool] = [:]
     private var printGeneration: [Printer: Int] = [:]
@@ -47,26 +45,16 @@ public actor CatPrinter {
         settings: Settings = .default
     ) {
         self.settings = settings
+        let managerProxy = managerProxy
+        let peripheralProxy = peripheralProxy
+        lifetime.addStreamFinisher { managerProxy.finish() }
+        lifetime.addStreamFinisher { peripheralProxy.finish() }
         setupObservers(
             printerNames: settings.printerName,
             characteristicId: settings.charateristic
         )
         // Default CBCentralManager queue is main; assign the delegate here, not from the actor.
         centralManager.delegate = managerProxy
-    }
-
-    deinit {
-        observationTasks.forEach { $0.cancel() }
-        for waiters in printWaiters.values {
-            for waiter in waiters {
-                waiter.continuation.resume(throwing: CatPrinterError.printerDisconnected)
-            }
-        }
-        for continuation in availablePrintersContinuations.values {
-            continuation.finish()
-        }
-        managerProxy.finish()
-        peripheralProxy.finish()
     }
     
     /// Will attempt to discover nearby printers. Supported printers are yielded by `availablePrintersUpdates`.
@@ -311,7 +299,7 @@ public actor CatPrinter {
         let characteristicsDiscovered = peripheralProxy.characteristicsDiscovered
 
         // Detached so these loops do not inherit the actor and keep CatPrinter alive.
-        observationTasks = [
+        lifetime.setObservationTasks([
             Task.detached { [weak self] in
                 for await discovery in peripheralDiscovered {
                     let peripheral = discovery.peripheral
@@ -349,37 +337,78 @@ public actor CatPrinter {
                     }
                 }
             }
-        ]
+        ])
     }
 
     private func addAvailablePrintersContinuation(
         _ id: UUID,
         _ continuation: AsyncStream<Set<Printer>>.Continuation
     ) {
-        if cancelledAvailablePrintersContinuations.remove(id) != nil {
-            continuation.finish()
-            return
-        }
-        availablePrintersContinuations[id] = continuation
-        continuation.yield(availablePrinters)
+        lifetime.addAvailablePrintersContinuation(id, continuation, current: availablePrinters)
     }
 
     private func removeAvailablePrintersContinuation(_ id: UUID) {
-        if availablePrintersContinuations.removeValue(forKey: id) == nil {
-            cancelledAvailablePrintersContinuations.insert(id)
-        }
+        lifetime.removeAvailablePrintersContinuation(id)
     }
 
     private func updateAvailablePrinters(_ update: (inout Set<Printer>) -> Void) {
         update(&availablePrinters)
-        for continuation in availablePrintersContinuations.values {
-            continuation.yield(availablePrinters)
-        }
+        lifetime.yieldAvailablePrinters(availablePrinters)
     }
 
     private struct PrintWaiter {
         let id: UUID
         let continuation: CheckedContinuation<Void, Error>
+    }
+
+    /// Nonisolated owner for work that must outlive the actor's isolated state.
+    /// `deinit` only cancels observer tasks and finishes streams.
+    private final class Lifetime {
+        private var observationTasks: [Task<Void, Never>] = []
+        private var availablePrintersContinuations: [UUID: AsyncStream<Set<Printer>>.Continuation] = [:]
+        private var cancelledAvailablePrintersContinuations: Set<UUID> = []
+        private var streamFinishers: [() -> Void] = []
+
+        func setObservationTasks(_ tasks: [Task<Void, Never>]) {
+            observationTasks = tasks
+        }
+
+        func addStreamFinisher(_ finish: @escaping () -> Void) {
+            streamFinishers.append(finish)
+        }
+
+        func addAvailablePrintersContinuation(
+            _ id: UUID,
+            _ continuation: AsyncStream<Set<Printer>>.Continuation,
+            current: Set<Printer>
+        ) {
+            if cancelledAvailablePrintersContinuations.remove(id) != nil {
+                continuation.finish()
+                return
+            }
+            availablePrintersContinuations[id] = continuation
+            continuation.yield(current)
+        }
+
+        func removeAvailablePrintersContinuation(_ id: UUID) {
+            if availablePrintersContinuations.removeValue(forKey: id) == nil {
+                cancelledAvailablePrintersContinuations.insert(id)
+            }
+        }
+
+        func yieldAvailablePrinters(_ printers: Set<Printer>) {
+            for continuation in availablePrintersContinuations.values {
+                continuation.yield(printers)
+            }
+        }
+
+        deinit {
+            observationTasks.forEach { $0.cancel() }
+            for continuation in availablePrintersContinuations.values {
+                continuation.finish()
+            }
+            streamFinishers.forEach { $0() }
+        }
     }
 }
 
