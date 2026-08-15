@@ -1,5 +1,5 @@
 import Foundation
-@_implementationOnly import CoreBluetooth
+@preconcurrency internal import CoreBluetooth
 
 extension CatPrinter {
     struct BluetoothInfo {

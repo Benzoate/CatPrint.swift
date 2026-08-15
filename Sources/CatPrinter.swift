@@ -1,6 +1,6 @@
 import Foundation
-@_implementationOnly import CoreBluetooth
-import CoreGraphics
+@preconcurrency internal import CoreBluetooth
+@preconcurrency import CoreGraphics
 import OSLog
 
 public actor CatPrinter {
@@ -28,33 +28,41 @@ public actor CatPrinter {
     
     let settings: Settings
     
-    private let centralManager: CBCentralManager = .init()
-    private let managerProxy = CentralManagerProxy()
-    private let peripheralProxy = PeripheralProxy()
+    private let centralManager: CBCentralManager
+    private let managerProxy: CentralManagerProxy
+    private let peripheralProxy: PeripheralProxy
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "CatPrinter")
     
     private var scanningPeripherals: [CBPeripheral] = []
     private var connectedPrinters: [Printer: BluetoothInfo] = [:]
-    private let lifetime = Lifetime()
+    private let lifetime: Lifetime
     
     private var isPrinting: [Printer: Bool] = [:]
     private var printGeneration: [Printer: Int] = [:]
     private var printWaiters: [Printer: [PrintWaiter]] = [:]
     
-    @MainActor public init(
+    public init(
         settings: Settings = .default
     ) {
         self.settings = settings
-        let managerProxy = managerProxy
-        let peripheralProxy = peripheralProxy
+        let managerProxy = CentralManagerProxy()
+        let peripheralProxy = PeripheralProxy()
+        let lifetime = Lifetime()
         lifetime.addStreamFinisher { managerProxy.finish() }
         lifetime.addStreamFinisher { peripheralProxy.finish() }
-        setupObservers(
+        self.managerProxy = managerProxy
+        self.peripheralProxy = peripheralProxy
+        self.lifetime = lifetime
+        // Callbacks run on the main queue; construct the manager with that queue and the delegate together.
+        self.centralManager = CBCentralManager(delegate: managerProxy, queue: .main)
+        Self.installObservers(
+            printer: self,
             printerNames: settings.printerName,
-            characteristicId: settings.charateristic
+            characteristicId: settings.charateristic,
+            managerProxy: managerProxy,
+            peripheralProxy: peripheralProxy,
+            lifetime: lifetime
         )
-        // Default CBCentralManager queue is main; assign the delegate here, not from the actor.
-        centralManager.delegate = managerProxy
     }
     
     /// Will attempt to discover nearby printers. Supported printers are yielded by `availablePrintersUpdates`.
@@ -288,48 +296,52 @@ public actor CatPrinter {
         scanningPeripherals.removeAll(where: { $0.identifier == peripheral.identifier })
     }
 
-    private func setupObservers(
+    private nonisolated static func installObservers(
+        printer: CatPrinter,
         printerNames: Set<String>,
-        characteristicId: String
+        characteristicId: String,
+        managerProxy: CentralManagerProxy,
+        peripheralProxy: PeripheralProxy,
+        lifetime: Lifetime
     ) {
-        let peripheralDiscovered = managerProxy.peripheralDiscovered
-        let peripheralDisconnected = managerProxy.peripheralDisconnected
-        let peripheralConnectionFailed = managerProxy.peripheralConnectionFailed
-        let servicesDiscovered = peripheralProxy.servicesDiscovered
-        let characteristicsDiscovered = peripheralProxy.characteristicsDiscovered
+        let peripheralDiscovered = UncheckedAsyncStream(managerProxy.peripheralDiscovered)
+        let peripheralDisconnected = UncheckedAsyncStream(managerProxy.peripheralDisconnected)
+        let peripheralConnectionFailed = UncheckedAsyncStream(managerProxy.peripheralConnectionFailed)
+        let servicesDiscovered = UncheckedAsyncStream(peripheralProxy.servicesDiscovered)
+        let characteristicsDiscovered = UncheckedAsyncStream(peripheralProxy.characteristicsDiscovered)
 
         // Detached so these loops do not inherit the actor and keep CatPrinter alive.
         lifetime.setObservationTasks([
-            Task.detached { [weak self] in
-                for await discovery in peripheralDiscovered {
+            Task.detached { [weak printer] in
+                for await discovery in peripheralDiscovered.stream {
                     let peripheral = discovery.peripheral
                     guard printerNames.isEmpty || printerNames.contains(peripheral.name ?? "") else {
                         continue
                     }
-                    await self?.connectToPeripheral(peripheral)
+                    await printer?.connectToPeripheral(peripheral)
                 }
             },
-            Task.detached { [weak self] in
-                for await peripheral in peripheralDisconnected {
-                    await self?.onPeripheralDisconnected(peripheral)
+            Task.detached { [weak printer] in
+                for await peripheral in peripheralDisconnected.stream {
+                    await printer?.onPeripheralDisconnected(peripheral)
                 }
             },
-            Task.detached { [weak self] in
-                for await peripheral in peripheralConnectionFailed {
-                    await self?.onPeripheralConnectionFailed(peripheral)
+            Task.detached { [weak printer] in
+                for await peripheral in peripheralConnectionFailed.stream {
+                    await printer?.onPeripheralConnectionFailed(peripheral)
                 }
             },
-            Task.detached { [weak self] in
-                for await peripheral in servicesDiscovered {
-                    await self?.onServicesDiscovered(peripheral)
+            Task.detached { [weak printer] in
+                for await peripheral in servicesDiscovered.stream {
+                    await printer?.onServicesDiscovered(peripheral)
                 }
             },
-            Task.detached { [weak self] in
-                for await (peripheral, service) in characteristicsDiscovered {
+            Task.detached { [weak printer] in
+                for await (peripheral, service) in characteristicsDiscovered.stream {
                     let matches = (service.characteristics ?? [])
                         .filter { characteristicId == $0.uuid.uuidString }
                     for characteristic in matches {
-                        await self?.registerMatchedCharacteristic(
+                        await printer?.registerMatchedCharacteristic(
                             peripheral: peripheral,
                             service: service,
                             characteristic: characteristic
@@ -363,7 +375,7 @@ public actor CatPrinter {
 
     /// Nonisolated owner for work that must outlive the actor's isolated state.
     /// `deinit` only cancels observer tasks and finishes streams.
-    private final class Lifetime {
+    private final class Lifetime: @unchecked Sendable {
         private var observationTasks: [Task<Void, Never>] = []
         private var availablePrintersContinuations: [UUID: AsyncStream<Set<Printer>>.Continuation] = [:]
         private var cancelledAvailablePrintersContinuations: Set<UUID> = []
@@ -413,7 +425,7 @@ public actor CatPrinter {
 }
 
 private extension CatPrinter {
-    final class CentralManagerProxy: NSObject, CBCentralManagerDelegate {
+    final class CentralManagerProxy: NSObject, CBCentralManagerDelegate, @unchecked Sendable {
         let peripheralDiscovered: AsyncStream<PeripheralDiscoveryData>
         let peripheralDisconnected: AsyncStream<CBPeripheral>
         let peripheralConnectionFailed: AsyncStream<CBPeripheral>
@@ -464,7 +476,7 @@ private extension CatPrinter {
             peripheralConnectionFailedContinuation.yield(peripheral)
         }
         
-        struct PeripheralDiscoveryData {
+        struct PeripheralDiscoveryData: @unchecked Sendable {
             let peripheral: CBPeripheral
             let advertisementData: [String : Any]
             let rssi: NSNumber
@@ -474,7 +486,7 @@ private extension CatPrinter {
 
 private extension CatPrinter {
     
-    final class PeripheralProxy: NSObject, CBPeripheralDelegate {
+    final class PeripheralProxy: NSObject, CBPeripheralDelegate, @unchecked Sendable {
         let servicesDiscovered: AsyncStream<CBPeripheral>
         let characteristicsDiscovered: AsyncStream<(CBPeripheral, CBService)>
 
@@ -503,6 +515,14 @@ private extension CatPrinter {
         func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
             servicesDiscoveredContinuation.yield(peripheral)
         }
+    }
+}
+
+private struct UncheckedAsyncStream<Element>: @unchecked Sendable {
+    let stream: AsyncStream<Element>
+
+    init(_ stream: AsyncStream<Element>) {
+        self.stream = stream
     }
 }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-struct PrinterImageData {
+struct PrinterImageData: Sendable {
     var data: [UInt8]
     var width: Int
     var height: Int
