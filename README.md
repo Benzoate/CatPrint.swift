@@ -39,15 +39,16 @@ func searchForPrinters() async {
 }
 ```
 
-You can then listen for available cat printers by subscribing to `availablePrinters` and handle that in a method of your choosing. This property will automatically update as printers connect and disconnect.
+You can then listen for available cat printers by iterating `availablePrintersUpdates`. The stream yields the current set immediately, then every subsequent change as printers connect and disconnect.
 
 ```swift
-await printer.$availablePrinters
-    .dropFirst()
-    .filter { $0.isEmpty == false }
-    .map { State.foundPrinters(Array($0)) }
-    .receive(on: RunLoop.main)
-    .assign(to: &$state)
+@MainActor
+func observePrinters() async {
+    for await printers in await printer.availablePrintersUpdates {
+        guard printers.isEmpty == false else { continue }
+        state = .foundPrinters(Array(printers))
+    }
+}
 ```
 
 Finally, once you have a printer you want to print to — you can print by providing a `CGImage`. The `CGImage` will automatically be re-sampled to the pixel width of the printer and converted to grayscale. There are some image processing options such as dithering available via the `imageProcessing` property. 
@@ -58,5 +59,6 @@ do {
                 printer: printerInfo
               )
 } catch CatPrinterError.noSuchPrinterConnected {
+} catch CatPrinterError.printerDisconnected {
 } catch { }
 ```

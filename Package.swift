@@ -1,4 +1,4 @@
-// swift-tools-version:5.7
+// swift-tools-version: 6.3
 
 import PackageDescription
 
@@ -13,15 +13,10 @@ let package = Package(
             targets: ["CatPrint"]
         ),
     ],
-    dependencies: [
-    ],
     targets: [
         .target(
             name: "CatPrint",
-            dependencies: [
-            ],
             path: "Sources"
         )
-    ],
-    swiftLanguageVersions: [.v5]
+    ]
 )

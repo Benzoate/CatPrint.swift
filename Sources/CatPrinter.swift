@@ -1,39 +1,72 @@
 import Foundation
-@_implementationOnly import CoreBluetooth
-import Combine
-import CoreGraphics
+@preconcurrency internal import CoreBluetooth
+@preconcurrency import CoreGraphics
 import OSLog
 
 public actor CatPrinter {
-    @Published private(set) public var availablePrinters: Set<Printer> = []
+    public private(set) var availablePrinters: Set<Printer> = []
+
+    /// Emits the current `availablePrinters` snapshot immediately, then every subsequent change.
+    public var availablePrintersUpdates: AsyncStream<Set<Printer>> {
+        AsyncStream { [weak self] continuation in
+            let id = UUID()
+            let printer = self
+            continuation.onTermination = { _ in
+                Task {
+                    await printer?.removeAvailablePrintersContinuation(id)
+                }
+            }
+            Task {
+                guard let printer else {
+                    continuation.finish()
+                    return
+                }
+                await printer.addAvailablePrintersContinuation(id, continuation)
+            }
+        }
+    }
     
     let settings: Settings
     
-    private let centralManager: CBCentralManager = .init()
-    private let managerProxy = CentralManagerProxy()
-    private let peripheralProxy = PeripheralProxy()
+    private let centralManager: CBCentralManager
+    private let managerProxy: CentralManagerProxy
+    private let peripheralProxy: PeripheralProxy
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "CatPrinter")
     
     private var scanningPeripherals: [CBPeripheral] = []
     private var connectedPrinters: [Printer: BluetoothInfo] = [:]
+    private let lifetime: Lifetime
     
-    private var cancellables: [AnyCancellable] = []
-    
-    private var printQueue: [Printer: [[PrinterCommands]]] = [:]
     private var isPrinting: [Printer: Bool] = [:]
+    private var printGeneration: [Printer: Int] = [:]
+    private var printWaiters: [Printer: [PrintWaiter]] = [:]
     
-    @MainActor public init(
+    public init(
         settings: Settings = .default
     ) {
         self.settings = settings
-        centralManager.delegate = managerProxy
-        Task {
-            await setupObservers()
-        }
+        let managerProxy = CentralManagerProxy()
+        let peripheralProxy = PeripheralProxy()
+        let lifetime = Lifetime()
+        lifetime.addStreamFinisher { managerProxy.finish() }
+        lifetime.addStreamFinisher { peripheralProxy.finish() }
+        self.managerProxy = managerProxy
+        self.peripheralProxy = peripheralProxy
+        self.lifetime = lifetime
+        // Callbacks run on the main queue; construct the manager with that queue and the delegate together.
+        self.centralManager = CBCentralManager(delegate: managerProxy, queue: .main)
+        Self.installObservers(
+            printer: self,
+            printerNames: settings.printerName,
+            characteristicId: settings.charateristic,
+            managerProxy: managerProxy,
+            peripheralProxy: peripheralProxy,
+            lifetime: lifetime
+        )
     }
     
-    /// Will attempt to discover nearby printers, supported printers will be published in `$availablePrinters`
-    public func startScan() throws {
+    /// Will attempt to discover nearby printers. Supported printers are yielded by `availablePrintersUpdates`.
+    public func startScan() async throws {
         guard centralManager.state == .poweredOn else {
             logger.info("Can not scan for peripherals as bluetooth is not powered on")
             throw CatPrinterError.bluetoothNotPoweredOn
@@ -55,10 +88,17 @@ public actor CatPrinter {
         printer: Printer,
         imageProcessing: ImageProcessingOption = .all
     ) async throws {
-        guard let bluetoothInfo = connectedPrinters[printer] else {
+        guard connectedPrinters[printer] != nil else {
             logger.error("Attempted to print to a printer that is not connected \(printer.name)<\(printer.uuid)>")
             throw CatPrinterError.noSuchPrinterConnected
         }
+
+        let printerWidth = settings.printerWidth
+        let useRunLengthEncoding = settings.useRunLengthEncoding
+        let processedImage = await Task.detached {
+            processPrinterImage(image, options: imageProcessing, printerWidth: printerWidth)
+        }.value
+        try Task.checkCancellation()
 
         let setupCommands: [PrinterCommands] = [
             .getDevState,
@@ -67,9 +107,9 @@ public actor CatPrinter {
             .setEnergy(255)
         ]
         let imageCommands: [PrinterCommands] = PrinterCommands.printImageCommands(
-            processImage(image: image, options: imageProcessing),
-            printerWidth: settings.printerWidth,
-            useRunLengthEncoding: settings.useRunLengthEncoding
+            processedImage,
+            printerWidth: printerWidth,
+            useRunLengthEncoding: useRunLengthEncoding
         )
         let endCommands: [PrinterCommands] = [
             .feedPaper(25),
@@ -79,24 +119,27 @@ public actor CatPrinter {
          ]
         
         logger.debug("Image processed into \(imageCommands.count) print commands")
-        guard isPrinting[printer] != true else {
-            if printQueue[printer] == nil { printQueue[printer] = [] }
-            printQueue[printer]?.append(setupCommands + imageCommands + endCommands)
-            return
+        try await acquirePrintSlot(printer)
+        let generation = printGeneration[printer] ?? 0
+        defer { releasePrintSlot(printer, generation: generation) }
+
+        guard let bluetoothInfo = connectedPrinters[printer] else {
+            throw CatPrinterError.printerDisconnected
         }
-        isPrinting[printer] = true
-        await executeCommands(
+        try await executeCommands(
             setupCommands + imageCommands + endCommands,
+            printer: printer,
+            generation: generation,
             bluetoothInfo: bluetoothInfo
         )
-        while printQueue[printer]?.isEmpty == false {
-            guard let commands = printQueue[printer]?.removeFirst() else { continue }
-            await executeCommands(commands, bluetoothInfo: bluetoothInfo)
-        }
-        isPrinting[printer] = false
     }
     
-    private func executeCommands(_ commands: [PrinterCommands], bluetoothInfo: BluetoothInfo) async {
+    private func executeCommands(
+        _ commands: [PrinterCommands],
+        printer: Printer,
+        generation: Int,
+        bluetoothInfo: BluetoothInfo
+    ) async throws {
         
         var commandData = Data(
             commands
@@ -118,83 +161,73 @@ public actor CatPrinter {
         logger.debug("Data split into \(packets.count) packets")
         
         for (offset, data) in packets.enumerated() {
+            try Task.checkCancellation()
+            guard isCurrentPrintSession(generation, printer: printer, bluetoothInfo: bluetoothInfo) else {
+                logger.debug("Print session ended, stopping command write")
+                throw CatPrinterError.printerDisconnected
+            }
             bluetoothInfo.peripheral.writeValue(data, for: bluetoothInfo.characteristic, type: .withoutResponse)
             logger.debug("Sent packet \(offset), waiting 50ms")
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(nanoseconds: 50_000_000)
         }
     }
-    
-    func processImage(
-        image sourceImage: CGImage,
-        options: ImageProcessingOption
-    ) -> PrinterImageData {
-        var image = sourceImage
-        logger.debug("Processing image [width:\(sourceImage.width), height: \(sourceImage.height)]")
-        if options.contains(.addWhiteBackground) {
-            image = image.addWhiteBackground()
-            logger.debug("Added white background to image")
-        }
 
-        if options.contains(.convertToGrayscale) {
-            image = image.toGrayscale()
-            logger.debug("Converted image to grayscale")
-        }
-
-        let targetSize = CGSize(
-            width: settings.printerWidth,
-            height: Int(Double(image.height) * Double(settings.printerWidth) / Double(image.width))
-        )
-
-        var result: PrinterImageData = .init(width: Int(targetSize.width), height: Int(targetSize.height))
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-        let context = CGContext(data: &result.data,
-                                width: result.width,
-                                height: result.height,
-                                bitsPerComponent: 8,
-                                bytesPerRow: result.width,
-                                space: colorSpace,
-                                bitmapInfo: CGImageAlphaInfo.none.rawValue)
-        context?.draw(
-            image,
-            in: CGRect(origin: .zero, size: targetSize)
-        )
-        
-        if options.contains(.floydSteinbergDithering) {
-            applyFloydSteinbergDithering(
-                pixelData: &result.data,
-                width: Int(targetSize.width),
-                height: Int(targetSize.height)
-            )
-        }
-
-        return result
+    private func isCurrentPrintSession(
+        _ generation: Int,
+        printer: Printer,
+        bluetoothInfo: BluetoothInfo
+    ) -> Bool {
+        (printGeneration[printer] ?? 0) == generation
+            && connectedPrinters[printer]?.peripheral.identifier == bluetoothInfo.peripheral.identifier
     }
 
-    private func applyFloydSteinbergDithering(
-        pixelData: inout [UInt8],
-        width: Int,
-        height: Int
-    ) {
-        logger.debug("Applying Floyd-Steinberg dithering")
-        func adjustPixel(y: Int, x: Int, delta: Int) {
-            guard 0..<height ~= y, 0..<width ~= x else {
+    private func invalidatePrintSession(for printer: Printer) {
+        printGeneration[printer, default: 0] += 1
+        isPrinting[printer] = nil
+        let waiters = printWaiters.removeValue(forKey: printer) ?? []
+        for waiter in waiters {
+            waiter.continuation.resume(throwing: CatPrinterError.printerDisconnected)
+        }
+    }
+
+    private func acquirePrintSlot(_ printer: Printer) async throws {
+        while true {
+            try Task.checkCancellation()
+            guard connectedPrinters[printer] != nil else {
+                throw CatPrinterError.printerDisconnected
+            }
+            if isPrinting[printer] != true {
+                isPrinting[printer] = true
                 return
             }
-            let index = y * width + x
-            pixelData[index] = UInt8(min(255, max(0, Int(pixelData[index]) + delta)))
-        }
-        for y in 0..<height {
-            for x in 0..<width {
-                let index = y * width + x
-                let newVal: UInt8 = if pixelData[index] > 127 { 255 } else { 0 }
-                let err: Int = Int(pixelData[index]) - Int(newVal)
-                pixelData[index] = newVal
-                adjustPixel(y: y, x: x + 1, delta: err * 7/16)
-                adjustPixel(y: y + 1, x: x - 1, delta: err * 3/16)
-                adjustPixel(y: y + 1, x: x, delta: err * 5/16)
-                adjustPixel(y: y + 1, x: x + 1, delta: err * 1/16)
+
+            let id = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    printWaiters[printer, default: []].append(
+                        PrintWaiter(id: id, continuation: continuation)
+                    )
+                }
+            } onCancel: {
+                Task { await self.removePrintWaiter(id, printer: printer) }
             }
         }
+    }
+
+    private func releasePrintSlot(_ printer: Printer, generation: Int) {
+        guard (printGeneration[printer] ?? 0) == generation else { return }
+        isPrinting[printer] = false
+        if let waiter = printWaiters[printer]?.isEmpty == false
+            ? printWaiters[printer]?.removeFirst()
+            : nil {
+            waiter.continuation.resume()
+        }
+    }
+
+    private func removePrintWaiter(_ id: UUID, printer: Printer) {
+        guard let index = printWaiters[printer]?.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = printWaiters[printer]?.remove(at: index)
+        waiter?.continuation.resume(throwing: CancellationError())
     }
     
     
@@ -213,9 +246,13 @@ public actor CatPrinter {
         logger.debug("Disconnected from peripheral \(peripheral.name ?? "")<\(peripheral.identifier)>")
         scanningPeripherals.removeAll(where: { $0.identifier == peripheral.identifier })
 
-        availablePrinters
-            .first(where: { $0.uuid == peripheral.identifier })
-            .flatMap { _ = availablePrinters.remove($0) }
+        let printer = availablePrinters.first { $0.uuid == peripheral.identifier }
+            ?? connectedPrinters.keys.first { $0.uuid == peripheral.identifier }
+        guard let printer else { return }
+
+        connectedPrinters[printer] = nil
+        invalidatePrintSession(for: printer)
+        updateAvailablePrinters { $0.remove(printer) }
     }
     
     private func registerMatchedCharacteristic(
@@ -225,9 +262,12 @@ public actor CatPrinter {
     ) {
         logger.debug("Connected to printer \(peripheral.name ?? "")<\(peripheral.identifier)>")
         let printer = Printer(uuid: peripheral.identifier, name: peripheral.name ?? "Printer")
+        if connectedPrinters[printer] != nil {
+            return
+        }
         connectedPrinters[printer] = .init(peripheral: peripheral, service: service, characteristic: characteristic)
         scanningPeripherals.removeAll(where: { $0.identifier.uuidString == peripheral.identifier.uuidString })
-        availablePrinters.insert(printer)
+        updateAvailablePrinters { $0.insert(printer) }
     }
     
     private func onServicesDiscovered(_ peripheral: CBPeripheral) {
@@ -251,76 +291,163 @@ public actor CatPrinter {
         }
     }
     
-    private func setupObservers() {
-        managerProxy.peripheralDiscovered
-            .map(\.peripheral)
-            .filter { [settings] peripheral in
-                settings.printerName.isEmpty || settings.printerName.contains(peripheral.name ?? "")
-            }
-            .sink { [weak self] peripheral in
-                Task { [weak self] in
-                    await self?.connectToPeripheral(peripheral)
+    private func onPeripheralConnectionFailed(_ peripheral: CBPeripheral) {
+        logger.warning("Failed to connect to peripheral \(peripheral.name ?? "")<\(peripheral.identifier)>")
+        scanningPeripherals.removeAll(where: { $0.identifier == peripheral.identifier })
+    }
+
+    private nonisolated static func installObservers(
+        printer: CatPrinter,
+        printerNames: Set<String>,
+        characteristicId: String,
+        managerProxy: CentralManagerProxy,
+        peripheralProxy: PeripheralProxy,
+        lifetime: Lifetime
+    ) {
+        let peripheralDiscovered = UncheckedAsyncStream(managerProxy.peripheralDiscovered)
+        let peripheralDisconnected = UncheckedAsyncStream(managerProxy.peripheralDisconnected)
+        let peripheralConnectionFailed = UncheckedAsyncStream(managerProxy.peripheralConnectionFailed)
+        let servicesDiscovered = UncheckedAsyncStream(peripheralProxy.servicesDiscovered)
+        let characteristicsDiscovered = UncheckedAsyncStream(peripheralProxy.characteristicsDiscovered)
+
+        // Detached so these loops do not inherit the actor and keep CatPrinter alive.
+        lifetime.setObservationTasks([
+            Task.detached { [weak printer] in
+                for await discovery in peripheralDiscovered.stream {
+                    let peripheral = discovery.peripheral
+                    guard printerNames.isEmpty || printerNames.contains(peripheral.name ?? "") else {
+                        continue
+                    }
+                    await printer?.connectToPeripheral(peripheral)
+                }
+            },
+            Task.detached { [weak printer] in
+                for await peripheral in peripheralDisconnected.stream {
+                    await printer?.onPeripheralDisconnected(peripheral)
+                }
+            },
+            Task.detached { [weak printer] in
+                for await peripheral in peripheralConnectionFailed.stream {
+                    await printer?.onPeripheralConnectionFailed(peripheral)
+                }
+            },
+            Task.detached { [weak printer] in
+                for await peripheral in servicesDiscovered.stream {
+                    await printer?.onServicesDiscovered(peripheral)
+                }
+            },
+            Task.detached { [weak printer] in
+                for await (peripheral, service) in characteristicsDiscovered.stream {
+                    let matches = (service.characteristics ?? [])
+                        .filter { characteristicId == $0.uuid.uuidString }
+                    for characteristic in matches {
+                        await printer?.registerMatchedCharacteristic(
+                            peripheral: peripheral,
+                            service: service,
+                            characteristic: characteristic
+                        )
+                    }
                 }
             }
-            .store(in: &cancellables)
-        
-        managerProxy.peripheralConnected
-            .sink { peripheral in
-                peripheral.discoverServices(nil)
+        ])
+    }
+
+    private func addAvailablePrintersContinuation(
+        _ id: UUID,
+        _ continuation: AsyncStream<Set<Printer>>.Continuation
+    ) {
+        lifetime.addAvailablePrintersContinuation(id, continuation, current: availablePrinters)
+    }
+
+    private func removeAvailablePrintersContinuation(_ id: UUID) {
+        lifetime.removeAvailablePrintersContinuation(id)
+    }
+
+    private func updateAvailablePrinters(_ update: (inout Set<Printer>) -> Void) {
+        update(&availablePrinters)
+        lifetime.yieldAvailablePrinters(availablePrinters)
+    }
+
+    private struct PrintWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    /// Nonisolated owner for work that must outlive the actor's isolated state.
+    /// `deinit` only cancels observer tasks and finishes streams.
+    private final class Lifetime: @unchecked Sendable {
+        private var observationTasks: [Task<Void, Never>] = []
+        private var availablePrintersContinuations: [UUID: AsyncStream<Set<Printer>>.Continuation] = [:]
+        private var cancelledAvailablePrintersContinuations: Set<UUID> = []
+        private var streamFinishers: [() -> Void] = []
+
+        func setObservationTasks(_ tasks: [Task<Void, Never>]) {
+            observationTasks = tasks
+        }
+
+        func addStreamFinisher(_ finish: @escaping () -> Void) {
+            streamFinishers.append(finish)
+        }
+
+        func addAvailablePrintersContinuation(
+            _ id: UUID,
+            _ continuation: AsyncStream<Set<Printer>>.Continuation,
+            current: Set<Printer>
+        ) {
+            if cancelledAvailablePrintersContinuations.remove(id) != nil {
+                continuation.finish()
+                return
             }
-            .store(in: &cancellables)
-        
-        managerProxy.peripheralDisconnected
-            .sink { [weak self] peripheral in
-                Task { [weak self] in
-                    await self?.onPeripheralDisconnected(peripheral)
-                }
+            availablePrintersContinuations[id] = continuation
+            continuation.yield(current)
+        }
+
+        func removeAvailablePrintersContinuation(_ id: UUID) {
+            if availablePrintersContinuations.removeValue(forKey: id) == nil {
+                cancelledAvailablePrintersContinuations.insert(id)
             }
-            .store(in: &cancellables)
-        
-        peripheralProxy.servicesDiscovered
-            .sink { [weak self] peripheral in
-                Task { [weak self] in
-                    await self?.onServicesDiscovered(peripheral)
-                }
+        }
+
+        func yieldAvailablePrinters(_ printers: Set<Printer>) {
+            for continuation in availablePrintersContinuations.values {
+                continuation.yield(printers)
             }
-            .store(in: &cancellables)
-        
-        peripheralProxy.characteristicsDiscovered
-            .flatMap { [charateristic = settings.charateristic] peripheral, service in
-                (service.characteristics ?? [])
-                    .filter { charateristic == $0.uuid.uuidString }
-                    .map { (peripheral, service, $0) }
-                    .publisher
+        }
+
+        deinit {
+            observationTasks.forEach { $0.cancel() }
+            for continuation in availablePrintersContinuations.values {
+                continuation.finish()
             }
-            .sink { [weak self] peripheral, service, characteristic in
-                Task { [weak self] in
-                    await self?.registerMatchedCharacteristic(
-                        peripheral: peripheral,
-                        service: service,
-                        characteristic: characteristic
-                    )
-                }
-            }
-            .store(in: &cancellables)
+            streamFinishers.forEach { $0() }
+        }
     }
 }
 
 private extension CatPrinter {
-    final class CentralManagerProxy: NSObject, CBCentralManagerDelegate {
-        private let stateUpdateSubject: PassthroughSubject<CBManagerState, Never> = .init()
-        private let peripheralDiscoveredSubject: PassthroughSubject<PeripheralDiscoveryData, Never> = .init()
-        private let peripheralConnectedSubject: PassthroughSubject<CBPeripheral, Never> = .init()
-        private let peripheralDisconnectedSubject: PassthroughSubject<CBPeripheral, Never> = .init()
-        
-        var stateUpdated: some Publisher<CBManagerState, Never> { stateUpdateSubject }
-        var peripheralDiscovered: some Publisher<PeripheralDiscoveryData, Never> { peripheralDiscoveredSubject }
-        var peripheralConnected: some Publisher<CBPeripheral, Never> { peripheralConnectedSubject }
-        var peripheralDisconnected: some Publisher<CBPeripheral, Never> { peripheralDisconnectedSubject }
-        
-        func centralManagerDidUpdateState(_ central: CBCentralManager) {
-            stateUpdateSubject.send(central.state)
+    final class CentralManagerProxy: NSObject, CBCentralManagerDelegate, @unchecked Sendable {
+        let peripheralDiscovered: AsyncStream<PeripheralDiscoveryData>
+        let peripheralDisconnected: AsyncStream<CBPeripheral>
+        let peripheralConnectionFailed: AsyncStream<CBPeripheral>
+
+        private let peripheralDiscoveredContinuation: AsyncStream<PeripheralDiscoveryData>.Continuation
+        private let peripheralDisconnectedContinuation: AsyncStream<CBPeripheral>.Continuation
+        private let peripheralConnectionFailedContinuation: AsyncStream<CBPeripheral>.Continuation
+
+        override init() {
+            (peripheralDiscovered, peripheralDiscoveredContinuation) = makeAsyncStream(bufferingPolicy: .unbounded)
+            (peripheralDisconnected, peripheralDisconnectedContinuation) = makeAsyncStream(bufferingPolicy: .unbounded)
+            (peripheralConnectionFailed, peripheralConnectionFailedContinuation) = makeAsyncStream(bufferingPolicy: .unbounded)
+            super.init()
         }
+
+        func finish() {
+            peripheralDiscoveredContinuation.finish()
+            peripheralDisconnectedContinuation.finish()
+            peripheralConnectionFailedContinuation.finish()
+        }
+        
+        func centralManagerDidUpdateState(_ central: CBCentralManager) {}
         
         func centralManager(
             _ central: CBCentralManager,
@@ -328,7 +455,7 @@ private extension CatPrinter {
             advertisementData: [String : Any],
             rssi RSSI: NSNumber
         ) {
-            peripheralDiscoveredSubject.send(
+            peripheralDiscoveredContinuation.yield(
                 .init(
                     peripheral: peripheral,
                     advertisementData: advertisementData,
@@ -338,14 +465,18 @@ private extension CatPrinter {
         }
         
         func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-            peripheralConnectedSubject.send(peripheral)
+            peripheral.discoverServices(nil)
         }
         
         func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-            peripheralDisconnectedSubject.send(peripheral)
+            peripheralDisconnectedContinuation.yield(peripheral)
+        }
+
+        func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+            peripheralConnectionFailedContinuation.yield(peripheral)
         }
         
-        struct PeripheralDiscoveryData {
+        struct PeripheralDiscoveryData: @unchecked Sendable {
             let peripheral: CBPeripheral
             let advertisementData: [String : Any]
             let rssi: NSNumber
@@ -355,23 +486,120 @@ private extension CatPrinter {
 
 private extension CatPrinter {
     
-    final class PeripheralProxy: NSObject, CBPeripheralDelegate {
-        private let servicesDiscoveredSubject: PassthroughSubject<CBPeripheral, Never> = .init()
-        private let characteristicsDiscoveredSubject: PassthroughSubject<(CBPeripheral, CBService), Never> = .init()
-        
-        var servicesDiscovered: some Publisher<CBPeripheral, Never> { servicesDiscoveredSubject }
-        var characteristicsDiscovered: some Publisher<(CBPeripheral, CBService), Never> { characteristicsDiscoveredSubject }
+    final class PeripheralProxy: NSObject, CBPeripheralDelegate, @unchecked Sendable {
+        let servicesDiscovered: AsyncStream<CBPeripheral>
+        let characteristicsDiscovered: AsyncStream<(CBPeripheral, CBService)>
+
+        private let servicesDiscoveredContinuation: AsyncStream<CBPeripheral>.Continuation
+        private let characteristicsDiscoveredContinuation: AsyncStream<(CBPeripheral, CBService)>.Continuation
+
+        override init() {
+            (servicesDiscovered, servicesDiscoveredContinuation) = makeAsyncStream(bufferingPolicy: .unbounded)
+            (characteristicsDiscovered, characteristicsDiscoveredContinuation) = makeAsyncStream(bufferingPolicy: .unbounded)
+            super.init()
+        }
+
+        func finish() {
+            servicesDiscoveredContinuation.finish()
+            characteristicsDiscoveredContinuation.finish()
+        }
         
         func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-            servicesDiscoveredSubject.send(peripheral)
+            servicesDiscoveredContinuation.yield(peripheral)
         }
         
         func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-            characteristicsDiscoveredSubject.send((peripheral, service))
+            characteristicsDiscoveredContinuation.yield((peripheral, service))
         }
 
         func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
-            servicesDiscoveredSubject.send(peripheral)
+            servicesDiscoveredContinuation.yield(peripheral)
+        }
+    }
+}
+
+private struct UncheckedAsyncStream<Element>: @unchecked Sendable {
+    let stream: AsyncStream<Element>
+
+    init(_ stream: AsyncStream<Element>) {
+        self.stream = stream
+    }
+}
+
+private func makeAsyncStream<Element>(
+    bufferingPolicy: AsyncStream<Element>.Continuation.BufferingPolicy
+) -> (AsyncStream<Element>, AsyncStream<Element>.Continuation) {
+    var continuation: AsyncStream<Element>.Continuation!
+    let stream = AsyncStream<Element>(bufferingPolicy: bufferingPolicy) { continuation = $0 }
+    return (stream, continuation)
+}
+
+private func processPrinterImage(
+    _ sourceImage: CGImage,
+    options: CatPrinter.ImageProcessingOption,
+    printerWidth: Int
+) -> PrinterImageData {
+    var image = sourceImage
+    if options.contains(.addWhiteBackground) {
+        image = image.addWhiteBackground()
+    }
+
+    if options.contains(.convertToGrayscale) {
+        image = image.toGrayscale()
+    }
+
+    let targetSize = CGSize(
+        width: printerWidth,
+        height: Int(Double(image.height) * Double(printerWidth) / Double(image.width))
+    )
+
+    var result: PrinterImageData = .init(width: Int(targetSize.width), height: Int(targetSize.height))
+    let colorSpace = CGColorSpaceCreateDeviceGray()
+    let context = CGContext(data: &result.data,
+                            width: result.width,
+                            height: result.height,
+                            bitsPerComponent: 8,
+                            bytesPerRow: result.width,
+                            space: colorSpace,
+                            bitmapInfo: CGImageAlphaInfo.none.rawValue)
+    context?.draw(
+        image,
+        in: CGRect(origin: .zero, size: targetSize)
+    )
+    
+    if options.contains(.floydSteinbergDithering) {
+        applyFloydSteinbergDithering(
+            pixelData: &result.data,
+            width: Int(targetSize.width),
+            height: Int(targetSize.height)
+        )
+    }
+
+    return result
+}
+
+private func applyFloydSteinbergDithering(
+    pixelData: inout [UInt8],
+    width: Int,
+    height: Int
+) {
+    func adjustPixel(y: Int, x: Int, delta: Int) {
+        guard 0..<height ~= y, 0..<width ~= x else {
+            return
+        }
+        let index = y * width + x
+        pixelData[index] = UInt8(min(255, max(0, Int(pixelData[index]) + delta)))
+    }
+    for y in 0..<height {
+        for x in 0..<width {
+            let index = y * width + x
+            let newVal: UInt8 = if pixelData[index] > 127 { 255 } else { 0 }
+            let err: Int = Int(pixelData[index]) - Int(newVal)
+            pixelData[index] = newVal
+            adjustPixel(y: y, x: x + 1, delta: err * 7/16)
+            adjustPixel(y: y + 1, x: x - 1, delta: err * 3/16)
+            adjustPixel(y: y + 1, x: x, delta: err * 5/16)
+            adjustPixel(y: y + 1, x: x + 1, delta: err * 1/16)
         }
     }
 }

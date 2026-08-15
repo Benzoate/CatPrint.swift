@@ -1,7 +1,7 @@
 import Foundation
 
 public extension CatPrinter {
-    struct Settings {
+    struct Settings: Sendable {
         public let services: Set<String>
         public let charateristic: String
         public let printerName: Set<String>
