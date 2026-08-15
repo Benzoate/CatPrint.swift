@@ -1,11 +1,26 @@
 import Foundation
 @_implementationOnly import CoreBluetooth
-import Combine
 import CoreGraphics
 import OSLog
 
 public actor CatPrinter {
-    @Published private(set) public var availablePrinters: Set<Printer> = []
+    public private(set) var availablePrinters: Set<Printer> = []
+
+    /// Emits the current `availablePrinters` snapshot immediately, then every subsequent change.
+    public var availablePrintersUpdates: AsyncStream<Set<Printer>> {
+        AsyncStream { [weak self] continuation in
+            let id = UUID()
+            let printer = self
+            continuation.onTermination = { _ in
+                Task {
+                    await printer?.removeAvailablePrintersContinuation(id)
+                }
+            }
+            Task {
+                await printer?.addAvailablePrintersContinuation(id, continuation)
+            }
+        }
+    }
     
     let settings: Settings
     
@@ -16,8 +31,7 @@ public actor CatPrinter {
     
     private var scanningPeripherals: [CBPeripheral] = []
     private var connectedPrinters: [Printer: BluetoothInfo] = [:]
-    
-    private var cancellables: [AnyCancellable] = []
+    private var availablePrintersContinuations: [UUID: AsyncStream<Set<Printer>>.Continuation] = [:]
     
     private var printQueue: [Printer: [[PrinterCommands]]] = [:]
     private var isPrinting: [Printer: Bool] = [:]
@@ -31,8 +45,16 @@ public actor CatPrinter {
             await setupObservers()
         }
     }
+
+    deinit {
+        for continuation in availablePrintersContinuations.values {
+            continuation.finish()
+        }
+        managerProxy.finish()
+        peripheralProxy.finish()
+    }
     
-    /// Will attempt to discover nearby printers, supported printers will be published in `$availablePrinters`
+    /// Will attempt to discover nearby printers. Supported printers are yielded by `availablePrintersUpdates`.
     public func startScan() throws {
         guard centralManager.state == .poweredOn else {
             logger.info("Can not scan for peripherals as bluetooth is not powered on")
@@ -213,9 +235,9 @@ public actor CatPrinter {
         logger.debug("Disconnected from peripheral \(peripheral.name ?? "")<\(peripheral.identifier)>")
         scanningPeripherals.removeAll(where: { $0.identifier == peripheral.identifier })
 
-        availablePrinters
-            .first(where: { $0.uuid == peripheral.identifier })
-            .flatMap { _ = availablePrinters.remove($0) }
+        if let printer = availablePrinters.first(where: { $0.uuid == peripheral.identifier }) {
+            updateAvailablePrinters { $0.remove(printer) }
+        }
     }
     
     private func registerMatchedCharacteristic(
@@ -227,7 +249,7 @@ public actor CatPrinter {
         let printer = Printer(uuid: peripheral.identifier, name: peripheral.name ?? "Printer")
         connectedPrinters[printer] = .init(peripheral: peripheral, service: service, characteristic: characteristic)
         scanningPeripherals.removeAll(where: { $0.identifier.uuidString == peripheral.identifier.uuidString })
-        availablePrinters.insert(printer)
+        updateAvailablePrinters { $0.insert(printer) }
     }
     
     private func onServicesDiscovered(_ peripheral: CBPeripheral) {
@@ -252,49 +274,47 @@ public actor CatPrinter {
     }
     
     private func setupObservers() {
-        managerProxy.peripheralDiscovered
-            .map(\.peripheral)
-            .filter { [settings] peripheral in
-                settings.printerName.isEmpty || settings.printerName.contains(peripheral.name ?? "")
-            }
-            .sink { [weak self] peripheral in
-                Task { [weak self] in
-                    await self?.connectToPeripheral(peripheral)
+        let peripheralDiscovered = managerProxy.peripheralDiscovered
+        let peripheralConnected = managerProxy.peripheralConnected
+        let peripheralDisconnected = managerProxy.peripheralDisconnected
+        let servicesDiscovered = peripheralProxy.servicesDiscovered
+        let characteristicsDiscovered = peripheralProxy.characteristicsDiscovered
+        let printerNames = settings.printerName
+        let characteristicId = settings.charateristic
+
+        Task { [weak self] in
+            for await discovery in peripheralDiscovered {
+                let peripheral = discovery.peripheral
+                guard printerNames.isEmpty || printerNames.contains(peripheral.name ?? "") else {
+                    continue
                 }
+                await self?.connectToPeripheral(peripheral)
             }
-            .store(in: &cancellables)
-        
-        managerProxy.peripheralConnected
-            .sink { peripheral in
+        }
+
+        Task {
+            for await peripheral in peripheralConnected {
                 peripheral.discoverServices(nil)
             }
-            .store(in: &cancellables)
-        
-        managerProxy.peripheralDisconnected
-            .sink { [weak self] peripheral in
-                Task { [weak self] in
-                    await self?.onPeripheralDisconnected(peripheral)
-                }
+        }
+
+        Task { [weak self] in
+            for await peripheral in peripheralDisconnected {
+                await self?.onPeripheralDisconnected(peripheral)
             }
-            .store(in: &cancellables)
-        
-        peripheralProxy.servicesDiscovered
-            .sink { [weak self] peripheral in
-                Task { [weak self] in
-                    await self?.onServicesDiscovered(peripheral)
-                }
+        }
+
+        Task { [weak self] in
+            for await peripheral in servicesDiscovered {
+                await self?.onServicesDiscovered(peripheral)
             }
-            .store(in: &cancellables)
-        
-        peripheralProxy.characteristicsDiscovered
-            .flatMap { [charateristic = settings.charateristic] peripheral, service in
-                (service.characteristics ?? [])
-                    .filter { charateristic == $0.uuid.uuidString }
-                    .map { (peripheral, service, $0) }
-                    .publisher
-            }
-            .sink { [weak self] peripheral, service, characteristic in
-                Task { [weak self] in
+        }
+
+        Task { [weak self] in
+            for await (peripheral, service) in characteristicsDiscovered {
+                let matches = (service.characteristics ?? [])
+                    .filter { characteristicId == $0.uuid.uuidString }
+                for characteristic in matches {
                     await self?.registerMatchedCharacteristic(
                         peripheral: peripheral,
                         service: service,
@@ -302,24 +322,58 @@ public actor CatPrinter {
                     )
                 }
             }
-            .store(in: &cancellables)
+        }
+    }
+
+    private func addAvailablePrintersContinuation(
+        _ id: UUID,
+        _ continuation: AsyncStream<Set<Printer>>.Continuation
+    ) {
+        availablePrintersContinuations[id] = continuation
+        continuation.yield(availablePrinters)
+    }
+
+    private func removeAvailablePrintersContinuation(_ id: UUID) {
+        availablePrintersContinuations.removeValue(forKey: id)
+    }
+
+    private func updateAvailablePrinters(_ update: (inout Set<Printer>) -> Void) {
+        update(&availablePrinters)
+        for continuation in availablePrintersContinuations.values {
+            continuation.yield(availablePrinters)
+        }
     }
 }
 
 private extension CatPrinter {
     final class CentralManagerProxy: NSObject, CBCentralManagerDelegate {
-        private let stateUpdateSubject: PassthroughSubject<CBManagerState, Never> = .init()
-        private let peripheralDiscoveredSubject: PassthroughSubject<PeripheralDiscoveryData, Never> = .init()
-        private let peripheralConnectedSubject: PassthroughSubject<CBPeripheral, Never> = .init()
-        private let peripheralDisconnectedSubject: PassthroughSubject<CBPeripheral, Never> = .init()
-        
-        var stateUpdated: some Publisher<CBManagerState, Never> { stateUpdateSubject }
-        var peripheralDiscovered: some Publisher<PeripheralDiscoveryData, Never> { peripheralDiscoveredSubject }
-        var peripheralConnected: some Publisher<CBPeripheral, Never> { peripheralConnectedSubject }
-        var peripheralDisconnected: some Publisher<CBPeripheral, Never> { peripheralDisconnectedSubject }
+        let stateUpdated: AsyncStream<CBManagerState>
+        let peripheralDiscovered: AsyncStream<PeripheralDiscoveryData>
+        let peripheralConnected: AsyncStream<CBPeripheral>
+        let peripheralDisconnected: AsyncStream<CBPeripheral>
+
+        private let stateUpdatedContinuation: AsyncStream<CBManagerState>.Continuation
+        private let peripheralDiscoveredContinuation: AsyncStream<PeripheralDiscoveryData>.Continuation
+        private let peripheralConnectedContinuation: AsyncStream<CBPeripheral>.Continuation
+        private let peripheralDisconnectedContinuation: AsyncStream<CBPeripheral>.Continuation
+
+        override init() {
+            (stateUpdated, stateUpdatedContinuation) = makeAsyncStream()
+            (peripheralDiscovered, peripheralDiscoveredContinuation) = makeAsyncStream()
+            (peripheralConnected, peripheralConnectedContinuation) = makeAsyncStream()
+            (peripheralDisconnected, peripheralDisconnectedContinuation) = makeAsyncStream()
+            super.init()
+        }
+
+        func finish() {
+            stateUpdatedContinuation.finish()
+            peripheralDiscoveredContinuation.finish()
+            peripheralConnectedContinuation.finish()
+            peripheralDisconnectedContinuation.finish()
+        }
         
         func centralManagerDidUpdateState(_ central: CBCentralManager) {
-            stateUpdateSubject.send(central.state)
+            stateUpdatedContinuation.yield(central.state)
         }
         
         func centralManager(
@@ -328,7 +382,7 @@ private extension CatPrinter {
             advertisementData: [String : Any],
             rssi RSSI: NSNumber
         ) {
-            peripheralDiscoveredSubject.send(
+            peripheralDiscoveredContinuation.yield(
                 .init(
                     peripheral: peripheral,
                     advertisementData: advertisementData,
@@ -338,11 +392,11 @@ private extension CatPrinter {
         }
         
         func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-            peripheralConnectedSubject.send(peripheral)
+            peripheralConnectedContinuation.yield(peripheral)
         }
         
         func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-            peripheralDisconnectedSubject.send(peripheral)
+            peripheralDisconnectedContinuation.yield(peripheral)
         }
         
         struct PeripheralDiscoveryData {
@@ -356,22 +410,41 @@ private extension CatPrinter {
 private extension CatPrinter {
     
     final class PeripheralProxy: NSObject, CBPeripheralDelegate {
-        private let servicesDiscoveredSubject: PassthroughSubject<CBPeripheral, Never> = .init()
-        private let characteristicsDiscoveredSubject: PassthroughSubject<(CBPeripheral, CBService), Never> = .init()
-        
-        var servicesDiscovered: some Publisher<CBPeripheral, Never> { servicesDiscoveredSubject }
-        var characteristicsDiscovered: some Publisher<(CBPeripheral, CBService), Never> { characteristicsDiscoveredSubject }
+        let servicesDiscovered: AsyncStream<CBPeripheral>
+        let characteristicsDiscovered: AsyncStream<(CBPeripheral, CBService)>
+
+        private let servicesDiscoveredContinuation: AsyncStream<CBPeripheral>.Continuation
+        private let characteristicsDiscoveredContinuation: AsyncStream<(CBPeripheral, CBService)>.Continuation
+
+        override init() {
+            (servicesDiscovered, servicesDiscoveredContinuation) = makeAsyncStream()
+            (characteristicsDiscovered, characteristicsDiscoveredContinuation) = makeAsyncStream()
+            super.init()
+        }
+
+        func finish() {
+            servicesDiscoveredContinuation.finish()
+            characteristicsDiscoveredContinuation.finish()
+        }
         
         func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-            servicesDiscoveredSubject.send(peripheral)
+            servicesDiscoveredContinuation.yield(peripheral)
         }
         
         func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-            characteristicsDiscoveredSubject.send((peripheral, service))
+            characteristicsDiscoveredContinuation.yield((peripheral, service))
         }
 
         func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
-            servicesDiscoveredSubject.send(peripheral)
+            servicesDiscoveredContinuation.yield(peripheral)
         }
     }
+}
+
+private func makeAsyncStream<Element>(
+    bufferingPolicy: AsyncStream<Element>.Continuation.BufferingPolicy = .unbounded
+) -> (AsyncStream<Element>, AsyncStream<Element>.Continuation) {
+    var continuation: AsyncStream<Element>.Continuation!
+    let stream = AsyncStream<Element>(bufferingPolicy: bufferingPolicy) { continuation = $0 }
+    return (stream, continuation)
 }
