@@ -59,5 +59,6 @@ do {
                 printer: printerInfo
               )
 } catch CatPrinterError.noSuchPrinterConnected {
+} catch CatPrinterError.printerDisconnected {
 } catch { }
 ```
