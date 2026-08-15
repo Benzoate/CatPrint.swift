@@ -1,5 +1,5 @@
 public extension CatPrinter {
-    struct ImageProcessingOption: OptionSet {
+    struct ImageProcessingOption: OptionSet, Sendable {
         public let rawValue: Int
         
         public static let addWhiteBackground = ImageProcessingOption(rawValue: 1 << 0)
